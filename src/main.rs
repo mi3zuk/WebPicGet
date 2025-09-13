@@ -1,0 +1,578 @@
+#![windows_subsystem = "windows"]
+
+use eframe::{egui::{self, ScrollArea, TextEdit, Id, ProgressBar, TextureHandle, FontDefinitions, FontData, FontFamily, Image}, App};
+use std::collections::{HashSet, VecDeque};
+use std::fs::File;
+use std::io::copy;
+use std::path::{PathBuf, Path};
+use std::sync::{Arc, Mutex};
+use tokio::runtime::Runtime;
+use scraper::{Html, Selector};
+use headless_chrome::Browser;
+use reqwest::Url; // Url クレートから Url 型をインポート
+use bytes::Bytes; // bytes クレートから Bytes 型をインポート
+use arboard::Clipboard; // クリップボード用
+use eframe::egui::ViewportBuilder;
+use image::GenericImageView;
+
+enum AppMode {
+    Download,
+    ImageExplorer,
+}
+
+impl Default for AppMode {
+    fn default() -> Self {
+        AppMode::Download
+    }
+}
+
+struct DownloaderApp {
+    current_mode: AppMode,
+    urls_input: Arc<Mutex<Vec<String>>>,
+    save_dir: Option<PathBuf>,
+    queue: VecDeque<String>,
+    logs: Arc<Mutex<Vec<String>>>,
+    downloading: bool,
+    focus_index: Option<usize>,
+    progress: Arc<Mutex<(usize, usize)>>,
+    page_load_progress: Arc<Mutex<f32>>,
+
+    image_page_url: String,
+    selected_preview_image: Arc<Mutex<Option<TextureHandle>>>,
+    found_images: Arc<Mutex<HashSet<String>>>,
+    selected_images: Arc<Mutex<HashSet<String>>>,
+    textures: Arc<Mutex<Vec<(String, Option<TextureHandle>)>>>,
+    // 非同期でダウンロードされた画像をUIスレッドに送るためのキュー
+    image_load_queue: Arc<Mutex<VecDeque<(String, Bytes)>>>, // bytes::Bytes を使用
+    clipboard_watching: bool, // クリップボード監視状態
+    last_clipboard: Option<String>, // 前回のクリップボード内容
+    clipboard_stop_flag: Option<Arc<Mutex<bool>>>, // 監視停止用フラグ
+}
+
+impl App for DownloaderApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.horizontal(|ui| {
+                if ui.selectable_label(matches!(self.current_mode, AppMode::Download), "URLから").clicked() {
+                    self.current_mode = AppMode::Download;
+                }
+                if ui.selectable_label(matches!(self.current_mode, AppMode::ImageExplorer), "探索").clicked() {
+                    self.current_mode = AppMode::ImageExplorer;
+                }
+            });
+
+            match self.current_mode {
+                AppMode::Download => self.update_download_mode(ctx, ui),
+                AppMode::ImageExplorer => self.update_image_explorer_mode(ctx, ui),
+            }
+        });
+    }
+}
+
+impl DownloaderApp {
+    fn update_download_mode(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.label("画像のアドレスを入力:");
+        ui.push_id("url_scroll", |ui| {
+            ScrollArea::vertical().max_height(300.0).show(ui, |ui| {
+                let mut to_remove = vec![];
+                let mut add_new = false;
+                let mut urls_input = self.urls_input.lock().unwrap();
+                for i in 0..urls_input.len() {
+                    ui.horizontal(|ui| {
+                        if ui.button("×").clicked() {
+                            to_remove.push(i);
+                        }
+                        let id = Id::new(format!("url_input_{}", i));
+                        if Some(i) == self.focus_index {
+                            ctx.memory_mut(|mem| mem.request_focus(id));
+                        }
+                        let response = ui.add(
+                            TextEdit::singleline(&mut urls_input[i])
+                                .desired_width(f32::INFINITY)
+                                .id(id),
+                        );
+                        if response.lost_focus() && response.ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            add_new = true;
+                        }
+                    });
+                }
+                for i in to_remove.iter().rev() {
+                    urls_input.remove(*i);
+                }
+                if add_new || urls_input.is_empty() {
+                    urls_input.push(String::new());
+                    self.focus_index = Some(urls_input.len() - 1);
+                } else {
+                    self.focus_index = None;
+                }
+            });
+        });
+
+        if ui.button("保存先フォルダを選択").clicked() {
+            if let Some(path) = rfd::FileDialog::new().pick_folder() {
+                self.save_dir = Some(path);
+            }
+        }
+
+        if let Some(dir) = &self.save_dir {
+            ui.label(format!("保存先: {}", dir.display()));
+        }
+
+        let mut watching = self.clipboard_watching;
+        ui.horizontal(|ui| {
+            if ui.checkbox(&mut watching, "クリップボード監視").changed() {
+                if watching && !self.clipboard_watching {
+                    // 監視開始
+                    self.clipboard_watching = true;
+                    let ctx = ctx.clone();
+                    let urls_input = Arc::clone(&self.urls_input);
+                    let last_clipboard = Arc::new(Mutex::new(self.last_clipboard.clone()));
+                    let stop_flag = Arc::new(Mutex::new(false));
+                    self.clipboard_stop_flag = Some(stop_flag.clone());
+                    std::thread::spawn({
+                        let urls_input = Arc::clone(&urls_input);
+                        let last_clipboard = Arc::clone(&last_clipboard);
+                        let stop_flag = Arc::clone(&stop_flag);
+                        move || {
+                            let mut clipboard = Clipboard::new().ok();
+                            loop {
+                                if *stop_flag.lock().unwrap() {
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(1000));
+                                if let Some(ref mut cb) = clipboard {
+                                    if let Ok(text) = cb.get_text() {
+                                        let mut last = last_clipboard.lock().unwrap();
+                                        if last.as_ref() != Some(&text) {
+                                            // URLらしいか簡易判定
+                                            if text.starts_with("http://") || text.starts_with("https://") {
+                                                let mut urls = urls_input.lock().unwrap();
+                                                urls.push(text.clone());
+                                                *last = Some(text);
+                                                ctx.request_repaint();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                } else if !watching && self.clipboard_watching {
+                    // 監視停止
+                    self.clipboard_watching = false;
+                    if let Some(flag) = &self.clipboard_stop_flag {
+                        let mut stop = flag.lock().unwrap();
+                        *stop = true;
+                    }
+                }
+            }
+        });
+        self.clipboard_watching = watching;
+
+        if ui.button("ダウンロード開始").clicked() && !self.downloading {
+            let urls_input = self.urls_input.lock().unwrap();
+            self.queue = urls_input
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let total = self.queue.len();
+            *self.progress.lock().unwrap() = (0, total);
+            self.logs.lock().unwrap().clear();
+            self.downloading = true;
+
+            let queue = self.queue.clone();
+            let save_dir = self.save_dir.clone();
+            let logs = Arc::clone(&self.logs);
+            let progress = Arc::clone(&self.progress);
+            let ctx = ctx.clone();
+
+            std::thread::spawn(move || {
+                let rt = Runtime::new().unwrap();
+                rt.block_on(async {
+                    for url in queue {
+                        let result = download_file(&url, save_dir.clone()).await;
+                        if let Ok(mut logs) = logs.lock() {
+                            if result.starts_with("失敗") { // ここを修正
+                                logs.push(result);
+                            }
+                        }
+                        if let Ok(mut p) = progress.lock() {
+                            p.0 += 1;
+                        }
+                        ctx.request_repaint();
+                    }
+                });
+            });
+        }
+
+        ui.separator();
+        ui.label("進捗:");
+        let (done, total) = *self.progress.lock().unwrap();
+        if total > 0 {
+            let fraction = done as f32 / total as f32;
+            ui.add(ProgressBar::new(fraction).text(format!("{}/{} 件完了", done, total)));
+            if done == total {
+                self.downloading = false;
+            }
+        }
+
+        ui.separator();
+        ui.label("失敗ログ:");
+        ui.push_id("log_scroll", |ui| {
+            ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                if let Ok(logs) = self.logs.lock() {
+                    for log in logs.iter() {
+                        ui.colored_label(egui::Color32::RED, log);
+                    }
+                }
+            });
+        });
+    }
+
+    fn update_image_explorer_mode(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
+        ui.label("探索");
+        ui.horizontal(|ui| {
+            ui.label("ページURL:");
+            ui.text_edit_singleline(&mut self.image_page_url);
+
+            if ui.button("ページを読み込む").clicked() {
+                let url = self.image_page_url.clone();
+                let found = Arc::clone(&self.found_images);
+                let textures = Arc::clone(&self.textures);
+                let progress = Arc::clone(&self.page_load_progress);
+                let ctx_clone = ctx.clone();
+                let image_load_queue = Arc::clone(&self.image_load_queue); // 追加
+
+                // 既存のテクスチャと選択画像をクリア
+                *textures.lock().unwrap() = Vec::new();
+                *self.selected_images.lock().unwrap() = HashSet::new();
+                *self.selected_preview_image.lock().unwrap() = None;
+
+
+                std::thread::spawn(move || {
+                    let rt = Runtime::new().unwrap();
+                    rt.block_on(async {
+                        if let Some(html) = fetch_html_with_progress(&url, progress, ctx_clone.clone()) {
+                            let document = Html::parse_document(&html);
+                            let selector = Selector::parse("img").unwrap();
+                            let mut new_images = HashSet::new();
+
+                            for element in document.select(&selector) {
+                                if let Some(src) = element.value().attr("src") {
+                                    let full_url = if src.starts_with("http") || src.starts_with("//") {
+                                        if src.starts_with("//") {
+                                            format!("http:{}", src) // "//" で始まるURLは "http:" を付加
+                                        } else {
+                                            src.to_string()
+                                        }
+                                    } else {
+                                        // 相対URLの場合、ベースURLと結合
+                                        let base_url_parsed = Url::parse(&url).ok();
+                                        let base_url = base_url_parsed
+                                            .as_ref()
+                                            .and_then(|u| u.join(".").ok()) // ベースURLの末尾に/を付ける目的でjoin('.')
+                                            .map(|u| u.to_string())
+                                            .unwrap_or_else(|| "".to_string());
+                                        
+                                        // PathBuf::join を使って正規化されたパスを生成する
+                                        let combined_path = PathBuf::from(base_url.trim_end_matches('/'))
+                                            .join(src.trim_start_matches('/'));
+                                        
+                                        // URLとして再度パースして正規化
+                                        if let Some(mut file_url) = Url::from_file_path(&combined_path).ok() {
+                                            // ファイルスキームの場合、通常はhostが空になるが、
+                                            // そのままだとHTTPリクエスト時に問題になる場合があるので調整
+                                            if file_url.scheme() == "file" && file_url.host_str().is_none() {
+                                                // もしくは、元のURLのschemeを継承する
+                                                if let Some(original_scheme_str) = base_url_parsed.as_ref().and_then(|u| Some(u.scheme())) { // ここは以前の修正のまま
+                                                    file_url.set_scheme(original_scheme_str).ok();
+                                                }
+                                            }
+                                            file_url.to_string()
+                                        } else {
+                                            combined_path.to_str().unwrap_or("").to_string()
+                                        }
+                                    };
+                                    new_images.insert(full_url);
+                                }
+                            }
+
+                            if let Ok(mut found_guard) = found.lock() {
+                                found_guard.clear();
+                                found_guard.extend(new_images.clone());
+                            }
+
+                            for img_url in new_images {
+                                // 画像のダウンロードは非同期スレッドで行い、結果をUIスレッドにキューイング
+                                let img_bytes_result = reqwest::get(&img_url).await;
+                                if let Ok(resp) = img_bytes_result {
+                                    if let Ok(bytes) = resp.bytes().await {
+                                        if let Ok(mut queue) = image_load_queue.lock() {
+                                            queue.push_back((img_url, bytes));
+                                        }
+                                        ctx_clone.request_repaint(); // UIスレッドに再描画を要求
+                                    }
+                                }
+                            }
+                        } else {
+                            println!("JavaScript対応HTMLの取得に失敗しました: {}", url);
+                        }
+                    });
+                });
+            }
+        });
+
+        ui.label("ページ読み込み進捗:");
+        let progress = self.page_load_progress.lock().unwrap();
+        ui.add(ProgressBar::new(*progress).text(format!("{:.0}%", *progress * 100.0)));
+
+        ui.separator();
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label("発見された画像:");
+                ui.push_id("image_list", |ui| {
+                    ScrollArea::vertical().max_height(1000.0).show(ui, |ui| {
+                        // キューから画像をロードし、テクスチャを作成
+                        let mut temp_textures_to_add = Vec::new();
+
+                        // ロードキューから画像を取得し、テクスチャを作成して一時リストに追加
+                        while let Some((url, bytes)) = self.image_load_queue.lock().unwrap().pop_front() {
+                            if let Ok(image) = image::load_from_memory(&bytes) {
+                                let size = [image.width() as usize, image.height() as usize];
+                                let image_buffer = image.to_rgba8();
+                                let pixels = image_buffer.as_flat_samples();
+                                let color_image = egui::ColorImage::from_rgba_unmultiplied(size, pixels.as_slice());
+                                let texture = ctx.load_texture(&url, color_image, egui::TextureOptions::default());
+
+                                temp_textures_to_add.push((url, Some(texture)));
+                            } else {
+                                temp_textures_to_add.push((url, None)); // 読み込み失敗した場合はNoneを格納
+                            }
+                        }
+
+                        // 一時リストのテクスチャをtexturesに移動
+                        if !temp_textures_to_add.is_empty() {
+                            if let Ok(mut tex_guard) = self.textures.lock() {
+                                for (url, texture_opt) in temp_textures_to_add {
+                                    // self.selected_preview_image にアクセスする際には self を使う
+                                    if texture_opt.is_some() && self.selected_preview_image.lock().unwrap().is_none() {
+                                        *self.selected_preview_image.lock().unwrap() = texture_opt.clone();
+                                    }
+                                    tex_guard.push((url, texture_opt));
+                                }
+                            }
+                        }
+
+                        // 表示部分
+                        if let Ok(texs) = self.textures.lock() {
+                            for (url, texture) in texs.iter() {
+                                let mut selected = self.selected_images.lock().unwrap().contains(url);
+                                ui.horizontal(|ui| {
+                                    if ui.checkbox(&mut selected, "").changed() {
+                                        let mut sel = self.selected_images.lock().unwrap();
+                                        if selected {
+                                            sel.insert(url.clone());
+                                            if let Some(tex) = texture {
+                                                *self.selected_preview_image.lock().unwrap() = Some(tex.clone());
+                                            }
+                                        } else {
+                                            sel.remove(url);
+                                            // 選択が解除された場合、プレビューをクリアするか、別の画像を表示するかは要検討
+                                            // 今回はそのままにしておく
+                                        }
+                                    }
+                                    if let Some(tex) = texture {
+                                        // max_width と max_height を使用
+                                        ui.add(egui::Image::new(tex).max_width(64.0).max_height(64.0)); // サムネイルサイズで表示
+                                    }
+                                    let filename = Url::parse(url)
+                                        .ok()
+                                        .and_then(|u| u.path_segments().map(|segments| segments.last().map(|s| s.to_string())))
+                                        .flatten() // Option<Option<String>> を Option<String> に変換
+                                        .filter(|s| !s.is_empty())
+                                        .unwrap_or_else(|| Path::new(url).file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| "unknown".to_string()));
+                                    ui.label(filename);
+                                });
+                            }
+                        }
+                    });
+                });
+            });
+
+            ui.vertical(|ui| {
+                ui.label("プレビュー:");
+                if let Some(tex) = self.selected_preview_image.lock().unwrap().as_ref() {
+                    ui.add(Image::new(tex).max_size(egui::vec2(300.0, 300.0)));
+                }
+            });
+        });
+
+
+        if ui.button("選択した画像を保存").clicked() {
+            let selected = self.selected_images.lock().unwrap().clone();
+            let save_dir = self.save_dir.clone();
+            for url in selected {
+                let save_dir = save_dir.clone();
+                std::thread::spawn(move || {
+                    let rt = Runtime::new().unwrap();
+                    rt.block_on(async {
+                        let _ = download_file(&url, save_dir).await;
+                    });
+                });
+            }
+        }
+    }
+}
+
+impl Default for DownloaderApp {
+    fn default() -> Self {
+        DownloaderApp {
+            current_mode: AppMode::Download,
+            urls_input: Arc::new(Mutex::new(vec![String::new()])),
+            save_dir: None,
+            queue: VecDeque::new(),
+            logs: Arc::new(Mutex::new(vec![])),
+            downloading: false,
+            focus_index: None,
+            progress: Arc::new(Mutex::new((0, 0))),
+            page_load_progress: Arc::new(Mutex::new(0.0)),
+            image_page_url: String::new(),
+            selected_preview_image: Arc::new(Mutex::new(None)),
+            found_images: Arc::new(Mutex::new(HashSet::new())),
+            selected_images: Arc::new(Mutex::new(HashSet::new())),
+            textures: Arc::new(Mutex::new(vec![])),
+            image_load_queue: Arc::new(Mutex::new(VecDeque::new())),
+            clipboard_watching: false,
+            last_clipboard: None,
+            clipboard_stop_flag: None,
+        }
+    }
+}
+
+async fn download_file(url: &str, save_dir: Option<PathBuf>) -> String {
+    let response = reqwest::get(url).await;
+    match response {
+        Ok(resp) => {
+            // URLからファイル名を抽出し、クエリパラメータを取り除く
+            let filename = Url::parse(url)
+                .ok()
+                .and_then(|u| {
+                    // `path_segments()` はイテレータを返すので、`last()` を呼んで最後のセグメントを取得し、
+                    // それを `map` して `to_string()` で所有する String に変換する
+                    u.path_segments().map(|segments| {
+                        segments.last()
+                            .map(|name| {
+                                // クエリパラメータを削除
+                                let name_without_query = name.split('?').next().unwrap_or(name);
+                                name_without_query.to_string()
+                            })
+                    })
+                })
+                .flatten() // Option<Option<String>> を Option<String> に変換
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| "downloaded_file".to_string());
+
+            let mut path = save_dir.unwrap_or_else(|| PathBuf::from("."));
+            path.push(&filename);
+
+            let bytes = resp.bytes().await;
+            match bytes {
+                Ok(data) => {
+                    let mut file = match File::create(&path) {
+                        Ok(f) => f,
+                        Err(e) => return format!("失敗: {} -> 保存失敗 ({})", url, e),
+                    };
+                    if let Err(e) = copy(&mut data.as_ref(), &mut file) {
+                        return format!("失敗: {} -> 書き込み失敗 ({})", url, e);
+                    }
+                    "成功".to_string()
+                }
+                Err(e) => format!("失敗: {} -> データ取得失敗 ({})", url, e),
+            }
+        }
+        Err(e) => format!("失敗: {} -> 接続失敗 ({})", url, e),
+    }
+}
+
+fn setup_custom_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    // NotoSansJP-Regular.ttf のパスを調整してください。
+    // 例: include_bytes!("../fonts/NotoSansJP-Regular.ttf")
+    fonts.font_data.insert(
+        "my_font".to_owned(),
+        FontData::from_static(include_bytes!("../NotoSansJP-Regular.ttf")),
+    );
+    fonts.families.entry(FontFamily::Proportional).or_default().insert(0, "my_font".to_owned());
+    fonts.families.entry(FontFamily::Monospace).or_default().push("my_font".to_owned());
+    ctx.set_fonts(fonts);
+}
+
+fn fetch_html_with_progress(url: &str, progress: Arc<Mutex<f32>>, ctx: egui::Context) -> Option<String> {
+    let browser = Browser::default().ok()?;
+    let tab = browser.new_tab().ok()?;
+    tab.navigate_to(url).ok()?;
+
+    {
+        let mut p = progress.lock().unwrap();
+        *p = 0.2;
+        ctx.request_repaint();
+    }
+
+    tab.wait_until_navigated().ok()?;
+
+    {
+        let mut p = progress.lock().unwrap();
+        *p = 0.5;
+        ctx.request_repaint();
+    }
+
+    for _ in 0..10 {
+        let state = tab.evaluate("document.readyState", false).ok()?.value?.as_str()?.to_string();
+        if state == "complete" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    {
+        let mut p = progress.lock().unwrap();
+        *p = 1.0;
+        ctx.request_repaint();
+    }
+
+    let html = tab.evaluate("document.body.innerHTML", false).ok()?.value?.as_str()?.to_string();
+    Some(html)
+}
+
+fn main() {
+    let bytes = include_bytes!("../WebPicGet.png");
+    let img = image::load_from_memory(bytes).expect("Failed to load icon");
+    let (w, h) = img.dimensions();
+    let rgba = img.to_rgba8().into_raw();
+    let viewport = ViewportBuilder::default()
+        .with_inner_size([1000.0, 800.0])
+        .with_icon(egui::IconData {
+            rgba,
+            width: w,
+            height: h,
+        })
+        .with_min_inner_size(egui::Vec2::new(300.0, 250.0));
+    let options = eframe::NativeOptions {
+        viewport,
+        ..Default::default()
+    };
+    let _ = eframe::run_native(
+        "WebPicGet",
+        options,
+        Box::new(|cc| {
+            setup_custom_fonts(&cc.egui_ctx);
+            Box::new(DownloaderApp {
+                page_load_progress: Arc::new(Mutex::new(0.0)),
+                selected_preview_image: Arc::new(Mutex::new(None)),
+                image_load_queue: Arc::new(Mutex::new(VecDeque::new())), // 追加
+                ..Default::default()
+            })
+        }),
+    );
+}

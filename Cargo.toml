@@ -1,0 +1,24 @@
+[package]
+name = "WebPicGet"
+version = "0.1.0"
+edition = "2021"
+build = "build.rs"
+
+[build-dependencies]
+winres = "0.1"
+
+[dependencies]
+eframe = "0.27"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.11"}
+rfd = "0.12"
+egui = "0.24"
+scraper = "0.19"
+egui_extras = "0.24"
+web-view = "0.7"
+base64 = "0.21"
+headless_chrome = "1.0"
+image = { version = "0.25", features = ["png", "ico"] } 
+url = "2.5"
+bytes = "1.6"
+arboard = "3"
