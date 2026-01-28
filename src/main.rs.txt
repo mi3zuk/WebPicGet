@@ -14,9 +14,6 @@ use bytes::Bytes; // bytes クレートから Bytes 型をインポート
 use arboard::Clipboard; // クリップボード用
 use eframe::egui::ViewportBuilder;
 use image::GenericImageView;
-use reqwest::header::{HeaderValue, COOKIE, USER_AGENT};
-use dirs_next;
-
 
 enum AppMode {
     Download,
@@ -31,11 +28,10 @@ impl Default for AppMode {
 
 struct DownloaderApp {
     current_mode: AppMode,
-    cookie_header: Arc<Mutex<Option<String>>>, // "name=value; name2=value2" 形式を想定
     urls_input: Arc<Mutex<Vec<String>>>,
     save_dir: Option<PathBuf>,
     queue: VecDeque<String>,
-    logs: Arc<Mutex<Vec<String>>>, // 表示用ログ
+    logs: Arc<Mutex<Vec<String>>>, // 表示用ログ（そのまま）
     failed_logs: Arc<Mutex<Vec<Vec<String>>>>, // セッションごとの失敗URL
     current_log_index: usize, // 最新セッションのインデックス
     downloading: bool,
@@ -84,29 +80,6 @@ impl App for DownloaderApp {
 
 impl DownloaderApp {
     fn update_download_mode(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-    ui.hyperlink_to("How to Use", "https://github.com/mi3zuk/WebPicGet/blob/main/README.md");
-    //Cookie
-    egui::CollapsingHeader::new("Cookie")
-        .default_open(false)
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let mut cookie_opt = self.cookie_header.lock().unwrap().clone().unwrap_or_default();
-                let response = ui.add(
-                    TextEdit::singleline(&mut cookie_opt)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("name=value"),
-                );
-                if response.lost_focus() || response.changed() {
-                    let mut guard = self.cookie_header.lock().unwrap();
-                    if cookie_opt.trim().is_empty() {
-                        *guard = None;
-                    } else {
-                        *guard = Some(cookie_opt.clone());
-                    }
-                }
-            });
-        });
-
     egui::CollapsingHeader::new("Num. Sequence")
         .default_open(false)
         .show(ui, |ui| {
@@ -193,7 +166,7 @@ impl DownloaderApp {
             });
         });
 
-        if ui.button("Output Folder").clicked() {
+        if ui.button("Save Directory").clicked() {
             if let Some(path) = rfd::FileDialog::new().pick_folder() {
                 self.save_dir = Some(path);
             }
@@ -254,7 +227,7 @@ impl DownloaderApp {
         });
         self.clipboard_watching = watching;
 
-        if ui.button("Get").clicked() && !self.downloading {
+        if ui.button("Download").clicked() && !self.downloading {
             let urls_input = self.urls_input.lock().unwrap();
             self.queue = urls_input
                 .iter()
@@ -282,21 +255,20 @@ impl DownloaderApp {
             let logs = Arc::clone(&self.logs);
             let progress = Arc::clone(&self.progress);
             let ctx = ctx.clone();
+
+            // 追加: 失敗ログの共有資源と、セッション番号をコピー
             let failed_logs = Arc::clone(&self.failed_logs);
             let current_log_index = self.current_log_index;
-
-            // cookie をクローンしてスレッドに渡す
-            let cookie_for_thread = self.cookie_header.lock().unwrap().clone();
 
             std::thread::spawn(move || {
                 let rt = Runtime::new().unwrap();
                 rt.block_on(async {
                     for url in queue {
-                        // cookie_for_thread を渡す
-                        let result = download_file(&url, save_dir.clone(), cookie_for_thread.clone()).await;
+                        let result = download_file(&url, save_dir.clone()).await;
                         if let Ok(mut logs_vec) = logs.lock() {
                             if result.starts_with("failed") {
                                 logs_vec.push(result);
+                                // セッション失敗ログにも今回の URL を追記
                                 if let Ok(mut all_failed) = failed_logs.lock() {
                                     if let Some(session) = all_failed.get_mut(current_log_index) {
                                         if !session.contains(&url) {
@@ -315,7 +287,6 @@ impl DownloaderApp {
             });
         }
 
-
         ui.separator();
         ui.label("Progress:");
         let (done, total) = *self.progress.lock().unwrap();
@@ -330,7 +301,7 @@ impl DownloaderApp {
         ui.separator();
 
         // 最新セッションの失敗URLを入力欄に一括追加
-        if ui.button("Add from Log").clicked() {
+        if ui.button("Add from log").clicked() {
             if let Some(session) = self.failed_logs.lock().unwrap().get(self.current_log_index) {
                 let mut urls = self.urls_input.lock().unwrap();
                 for u in session.iter() {
@@ -355,82 +326,96 @@ impl DownloaderApp {
     }
 
     fn update_image_explorer_mode(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
-        ui.hyperlink_to("How to Use", "https://github.com/mi3zuk/WebPicGet/blob/main/README.md");
         ui.label("Search");
         ui.horizontal(|ui| {
             ui.label("URL:");
             ui.text_edit_singleline(&mut self.image_page_url);
 
-        if ui.button("Load").clicked() {
-            let url = self.image_page_url.clone();
-            let found = Arc::clone(&self.found_images);
-            let textures = Arc::clone(&self.textures);
-            let progress = Arc::clone(&self.page_load_progress);
-            let ctx_clone = ctx.clone();
-            let image_load_queue = Arc::clone(&self.image_load_queue);
+            if ui.button("Load").clicked() {
+                let url = self.image_page_url.clone();
+                let found = Arc::clone(&self.found_images);
+                let textures = Arc::clone(&self.textures);
+                let progress = Arc::clone(&self.page_load_progress);
+                let ctx_clone = ctx.clone();
+                let image_load_queue = Arc::clone(&self.image_load_queue); // 追加
 
-            // ここで cookie をクローンしてスレッドに渡す
-            let cookie_for_thread = self.cookie_header.lock().unwrap().clone();
+                // 既存のテクスチャと選択画像をクリア
+                *textures.lock().unwrap() = Vec::new();
+                *self.selected_images.lock().unwrap() = HashSet::new();
+                *self.selected_preview_image.lock().unwrap() = None;
 
-            // 既存のクリア処理
-            *textures.lock().unwrap() = Vec::new();
-            *self.selected_images.lock().unwrap() = HashSet::new();
-            *self.selected_preview_image.lock().unwrap() = None;
 
-            std::thread::spawn(move || {
-                let rt = Runtime::new().unwrap();
-                rt.block_on(async {
-                    if let Some(html) = fetch_html_with_progress(&url, progress, ctx_clone.clone(), cookie_for_thread.clone()) {
-                        let document = Html::parse_document(&html);
-                        let selector = Selector::parse("img").unwrap();
-                        let mut new_images = HashSet::new();
+                std::thread::spawn(move || {
+                    let rt = Runtime::new().unwrap();
+                    rt.block_on(async {
+                        if let Some(html) = fetch_html_with_progress(&url, progress, ctx_clone.clone()) {
+                            let document = Html::parse_document(&html);
+                            let selector = Selector::parse("img").unwrap();
+                            let mut new_images = HashSet::new();
 
-                        for element in document.select(&selector) {
-                            if let Some(src) = element.value().attr("src") {
-                                // 既存の URL 正規化ロジックを使って full_url を作る（省略せずそのまま使ってください）
-                                // ... (既存の相対URL処理)
-                                // ここでは簡潔化のため src をそのまま使う例:
-                                let full_url = if src.starts_with("http") || src.starts_with("//") {
-                                    if src.starts_with("//") { format!("http:{}", src) } else { src.to_string() }
-                                } else {
-                                    // 相対URL処理（元のコードをそのまま使ってください）
-                                    src.to_string()
-                                };
-                                new_images.insert(full_url);
-                            }
-                        }
-
-                        if let Ok(mut found_guard) = found.lock() {
-                            found_guard.clear();
-                            found_guard.extend(new_images.clone());
-                        }
-
-                        // 画像ダウンロード時も cookie を付与するため client を作成
-                        let client = reqwest::Client::builder().build().unwrap();
-
-                        for img_url in new_images {
-                            let mut req = client.get(&img_url);
-                            if let Some(cookie_str) = cookie_for_thread.clone() {
-                                if let Ok(hv) = HeaderValue::from_str(&cookie_str) {
-                                    req = req.header(COOKIE, hv);
+                            for element in document.select(&selector) {
+                                if let Some(src) = element.value().attr("src") {
+                                    let full_url = if src.starts_with("http") || src.starts_with("//") {
+                                        if src.starts_with("//") {
+                                            format!("http:{}", src) // "//" で始まるURLは "http:" を付加
+                                        } else {
+                                            src.to_string()
+                                        }
+                                    } else {
+                                        // 相対URLの場合、ベースURLと結合
+                                        let base_url_parsed = Url::parse(&url).ok();
+                                        let base_url = base_url_parsed
+                                            .as_ref()
+                                            .and_then(|u| u.join(".").ok()) // ベースURLの末尾に/を付ける目的でjoin('.')
+                                            .map(|u| u.to_string())
+                                            .unwrap_or_else(|| "".to_string());
+                                        
+                                        // PathBuf::join を使って正規化されたパスを生成する
+                                        let combined_path = PathBuf::from(base_url.trim_end_matches('/'))
+                                            .join(src.trim_start_matches('/'));
+                                        
+                                        // URLとして再度パースして正規化
+                                        if let Some(mut file_url) = Url::from_file_path(&combined_path).ok() {
+                                            // ファイルスキームの場合、通常はhostが空になるが、
+                                            // そのままだとHTTPリクエスト時に問題になる場合があるので調整
+                                            if file_url.scheme() == "file" && file_url.host_str().is_none() {
+                                                // もしくは、元のURLのschemeを継承する
+                                                if let Some(original_scheme_str) = base_url_parsed.as_ref().and_then(|u| Some(u.scheme())) { // ここは以前の修正のまま
+                                                    file_url.set_scheme(original_scheme_str).ok();
+                                                }
+                                            }
+                                            file_url.to_string()
+                                        } else {
+                                            combined_path.to_str().unwrap_or("").to_string()
+                                        }
+                                    };
+                                    new_images.insert(full_url);
                                 }
                             }
-                            if let Ok(resp) = req.send().await {
-                                if let Ok(bytes) = resp.bytes().await {
-                                    if let Ok(mut queue) = image_load_queue.lock() {
-                                        queue.push_back((img_url, bytes));
+
+                            if let Ok(mut found_guard) = found.lock() {
+                                found_guard.clear();
+                                found_guard.extend(new_images.clone());
+                            }
+
+                            for img_url in new_images {
+                                // 画像のダウンロードは非同期スレッドで行い、結果をUIスレッドにキューイング
+                                let img_bytes_result = reqwest::get(&img_url).await;
+                                if let Ok(resp) = img_bytes_result {
+                                    if let Ok(bytes) = resp.bytes().await {
+                                        if let Ok(mut queue) = image_load_queue.lock() {
+                                            queue.push_back((img_url, bytes));
+                                        }
+                                        ctx_clone.request_repaint(); // UIスレッドに再描画を要求
                                     }
-                                    ctx_clone.request_repaint();
                                 }
                             }
+                        } else {
+                            println!("JavaScript対応HTMLの取得に失敗しました: {}", url);
                         }
-                    } else {
-                        println!("JavaScript対応HTMLの取得に失敗しました: {}", url);
-                    }
+                    });
                 });
-            });
-        }
-
+            }
         });
 
         ui.label("Progress:");
@@ -522,38 +507,28 @@ impl DownloaderApp {
         if ui.button("Save Select img").clicked() {
             let selected = self.selected_images.lock().unwrap().clone();
             let save_dir = self.save_dir.clone();
-            // cookie をクローンして渡す
-            let cookie_for_save = self.cookie_header.lock().unwrap().clone();
-
             for url in selected {
                 let save_dir = save_dir.clone();
-                let cookie_for_save = cookie_for_save.clone();
                 std::thread::spawn(move || {
                     let rt = Runtime::new().unwrap();
                     rt.block_on(async {
-                        let _ = download_file(&url, save_dir, cookie_for_save.clone()).await;
+                        let _ = download_file(&url, save_dir).await;
                     });
                 });
             }
         }
-
     }
 }
 
 impl Default for DownloaderApp {
     fn default() -> Self {
-        // ダウンロードフォルダを取得。見つからなければホーム/Downloads を代替にする。
-        let save_dir_default: Option<PathBuf> = dirs_next::download_dir().or_else(|| {
-            dirs_next::home_dir().map(|h| h.join("Downloads"))
-        });
-
         DownloaderApp {
             current_mode: AppMode::Download,
             urls_input: Arc::new(Mutex::new(vec![String::new()])),
-            save_dir: save_dir_default,
+            save_dir: None,
             queue: VecDeque::new(),
             logs: Arc::new(Mutex::new(vec![])),
-            failed_logs: Arc::new(Mutex::new(vec![vec![]])),
+            failed_logs: Arc::new(Mutex::new(vec![vec![]])), // 初期セッション
             current_log_index: 0,
             downloading: false,
             focus_index: None,
@@ -568,63 +543,45 @@ impl Default for DownloaderApp {
             clipboard_watching: false,
             last_clipboard: None,
             clipboard_stop_flag: None,
+            // 番号列一括追加デフォルト
             batch_pattern:  "https://foo/{N}.png".to_owned(),
             batch_placeholder: "{N}".to_owned(),
             batch_digits: 3,
             batch_start: 1,
             batch_end: 3,
             batch_step: 1,
-            cookie_header: Arc::new(Mutex::new(None)),
         }
     }
 }
 
-async fn download_file(url: &str, save_dir: Option<PathBuf>, cookie: Option<String>) -> String {
-    // Client を作成（cookie_store は任意）
-    let client = reqwest::Client::builder()
-        .build()
-        .unwrap();
-
-    let mut req = client.get(url);
-
-    if let Some(cookie_str) = cookie {
-        // そのまま Cookie ヘッダとして渡す
-        if let Ok(hv) = HeaderValue::from_str(&cookie_str) {
-            req = req.header(COOKIE, hv);
-        }
-    }
-
-    // 任意で UA を付けると成功率が上がることがある
-    req = req.header(USER_AGENT, HeaderValue::from_static("DownloaderApp/1.0"));
-
-    match req.send().await {
+async fn download_file(url: &str, save_dir: Option<PathBuf>) -> String {
+    let response = reqwest::get(url).await;
+    match response {
         Ok(resp) => {
-            if !resp.status().is_success() {
-                let code = resp.status().as_u16();
-                let user_msg = http_status_message_from_status(code);
-                return format!("failed: {} -> {}", url, user_msg); 
-            }
-
-            // ファイル名抽出は既存ロジックを流用
+            // URLからファイル名を抽出し、クエリパラメータを取り除く
             let filename = Url::parse(url)
                 .ok()
                 .and_then(|u| {
+                    // `path_segments()` はイテレータを返すので、`last()` を呼んで最後のセグメントを取得し、
+                    // それを `map` して `to_string()` で所有する String に変換する
                     u.path_segments().map(|segments| {
                         segments.last()
                             .map(|name| {
+                                // クエリパラメータを削除
                                 let name_without_query = name.split('?').next().unwrap_or(name);
                                 name_without_query.to_string()
                             })
                     })
                 })
-                .flatten()
+                .flatten() // Option<Option<String>> を Option<String> に変換
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| "downloaded_file".to_string());
 
             let mut path = save_dir.unwrap_or_else(|| PathBuf::from("."));
             path.push(&filename);
 
-            match resp.bytes().await {
+            let bytes = resp.bytes().await;
+            match bytes {
                 Ok(data) => {
                     let mut file = match File::create(&path) {
                         Ok(f) => f,
@@ -638,13 +595,9 @@ async fn download_file(url: &str, save_dir: Option<PathBuf>, cookie: Option<Stri
                 Err(e) => format!("failed: {} -> データ取得失敗 ({})", url, e),
             }
         }
-        Err(e) => {
-            let user_msg = http_error_message_from_reqwest(&e);
-            return format!("failed: {} -> {}", url, user_msg);
-        }
+        Err(e) => format!("failed: {} -> 接続失敗 ({})", url, e),
     }
 }
-
 
 fn setup_custom_fonts(ctx: &egui::Context) {
     let mut fonts = FontDefinitions::default();
@@ -659,82 +612,42 @@ fn setup_custom_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-fn fetch_html_with_progress(url: &str, progress: Arc<Mutex<f32>>, ctx: egui::Context, cookie: Option<String>) -> Option<String> {
-    // headless_chrome を使って JS 実行後の HTML を取得する（document.cookie を使って Cookie を注入）
+fn fetch_html_with_progress(url: &str, progress: Arc<Mutex<f32>>, ctx: egui::Context) -> Option<String> {
     let browser = Browser::default().ok()?;
     let tab = browser.new_tab().ok()?;
+    tab.navigate_to(url).ok()?;
 
-    // まずページに移動（初回ナビゲート）
-    if tab.navigate_to(url).is_err() { return None; }
-    if tab.wait_until_navigated().is_err() { return None; }
-
-    // Cookie 注入: "name=value; name2=value2" 形式を想定
-    if let Some(cookie_str) = cookie {
-        for pair in cookie_str.split(';') {
-            let pair = pair.trim();
-            if pair.is_empty() { continue; }
-            if let Some((name, value)) = pair.split_once('=') {
-                // document.cookie を使ってクッキーをセット（path=/ を付与）
-                // 値にシングルクォートや改行が含まれる可能性があるため簡易エスケープ
-                let name_esc = name.trim().replace('\\', "\\\\").replace('\'', "\\'");
-                let value_esc = value.trim().replace('\\', "\\\\").replace('\'', "\\'");
-                let js = format!("document.cookie = '{}={}; path=/;';", name_esc, value_esc);
-                // evaluate で実行（失敗しても続行）
-                let _ = tab.evaluate(&js, false);
-            }
-        }
-
-        // Cookie を注入したので再読み込みしてクッキー反映を待つ
-        let _ = tab.reload(true, None);
-        // 少し待つ（JS 実行やリダイレクト待ち）
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let _ = tab.wait_until_navigated();
+    {
+        let mut p = progress.lock().unwrap();
+        *p = 0.2;
+        ctx.request_repaint();
     }
 
-    // 進捗を 100% に更新して UI 再描画
+    tab.wait_until_navigated().ok()?;
+
+    {
+        let mut p = progress.lock().unwrap();
+        *p = 0.5;
+        ctx.request_repaint();
+    }
+
+    for _ in 0..10 {
+        let state = tab.evaluate("document.readyState", false).ok()?.value?.as_str()?.to_string();
+        if state == "complete" {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
     {
         let mut p = progress.lock().unwrap();
         *p = 1.0;
+        ctx.request_repaint();
     }
-    ctx.request_repaint();
 
-    // ページの HTML を取得して返す
-    tab.get_content().ok()
+    let html = tab.evaluate("document.body.innerHTML", false).ok()?.value?.as_str()?.to_string();
+    Some(html)
 }
-
-/// HTTP ステータスコードや reqwest のエラーを日本語の説明に変換する
-fn http_status_message_from_status(status: u16) -> String {
-    match status {
-        400 => "不正なリクエストです（400）".to_string(),
-        401 => "認証が必要です（401）".to_string(),
-        403 => "アクセス権限がありません（403）".to_string(),
-        404 => "指定されたリソースが見つかりません（404）".to_string(),
-        408 => "リクエストがタイムアウトしました（408）".to_string(),
-        429 => "リクエストが多すぎます（429）".to_string(),
-        500 => "サーバー内部でエラーが発生しました（500）".to_string(),
-        502 => "不正なゲートウェイ（502）".to_string(),
-        503 => "サービス利用不可（503）".to_string(),
-        504 => "ゲートウェイタイムアウト（504）".to_string(),
-        code => format!("サーバーがエラーを返しました（{}）", code),
-    }
-}
-
-/// reqwest::Error を受け取り、ユーザー向けメッセージに変換する
-fn http_error_message_from_reqwest(err: &reqwest::Error) -> String {
-    if err.is_timeout() {
-        "通信がタイムアウトしました。ネットワーク接続を確認してください。".to_string()
-    } else if err.is_connect() {
-        "サーバーに接続できませんでした。ネットワークまたはURLを確認してください。".to_string()
-    } else if err.is_request() {
-        "リクエストの送信に失敗しました。URLやヘッダを確認してください。".to_string()
-    } else if err.is_status() {
-        // ステータスエラーは呼び出し側で処理する想定だが念のため
-        "サーバーがエラーを返しました。".to_string()
-    } else {
-        format!("通信エラーが発生しました: {}", err)
-    }
-}
-
 
 fn main() {
     let bytes = include_bytes!("../WebPicGet.png");
